@@ -1,6 +1,8 @@
 import os
 import glob
 import json
+import ijson
+import decimal
 import time
 import random
 from pathlib import Path
@@ -25,9 +27,7 @@ from bs4 import BeautifulSoup
 
 class Config:
     """
-    Centralise tous les paramètres du script.
-    - CHUNK_TOK : nombre de tokens max par chunk (dépend du modèle d'embedding).
-      Par défaut 512, possible jusqu'à 8191 tokens pour text-embedding-ada-002 (OpenAI/Azure).
+    Paramètres du pipeline. Tout est overridable via le .env (cf. doc en haut du script).
     """
     def __init__(self):
         load_dotenv()
@@ -38,21 +38,28 @@ class Config:
         self.INDEX_NAME = os.getenv("INDEX_NAME")
         self.DIR = "*.csv"
         self.ACTIONNAIRE_CSV = "data/ACTIONNAIRES.csv"
-        self.CHUNK_TOK = int(os.getenv("CHUNK_TOK", "512"))  # <---- Override possible, cf. doc
+        self.CHUNK_TOK = int(os.getenv("CHUNK_TOK", "512"))
         self.CHUNK_OVER = 0
-        self.MIN_CHUNK_TOK = 200
-        self.EMBEDDING_MODEL = "text-embedding-ada-002"
-        self.EMBED_BATCH = 430
-        self.BATCH_UPLOAD = 975
-        self.JSON_PATH = "chunked_docs_final.json"
-        self.ERROR_LOG_PATH = "failed_uploads.log"
+        self.MIN_CHUNK_TOK = 50
+        self.EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-ada-002")
+        self.EMBEDDING_DEPLOYMENT_NAME = os.getenv("EMBEDDING_DEPLOYMENT_NAME", "text-embedding-ada")
+        self.EMBED_BATCH = int(os.getenv("EMBED_BATCH", "250"))
+        self.BATCH_UPLOAD = int(os.getenv("BATCH_UPLOAD", "500"))
+        self.JSON_PATH = os.getenv("JSON_PATH", "chunked_docs_final.json")
+        self.JSONL_PATH = os.getenv("JSONL_PATH", "chunked_docs_final.jsonl")
+        self.ERROR_LOG_PATH = os.getenv("ERROR_LOG_PATH", "failed_uploads.log")
         self.EMBED_BEFORE_UPLOAD = os.getenv("EMBED_BEFORE_UPLOAD", "False").lower() == "true"
-        self.SUPPORTED_EXTENSIONS = [".csv", ".txt"]  # Peut être étendu à ".pdf"
+        self.UPLOAD_ONLY = os.getenv("UPLOAD_ONLY", "False").lower() == "true"
+        self.RECREATE_INDEX = os.getenv("RECREATE_INDEX", "True").lower() == "true"
+        self.SAVE_CHUNKS_LOCALLY = os.getenv("SAVE_CHUNKS_LOCALLY", "True").lower() == "true"
+        self.UPLOAD_STREAMING = os.getenv("UPLOAD_STREAMING", "False").lower() == "true"
+        self.USE_JSONL = os.getenv("USE_JSONL", "False").lower() == "true"
+        self.SUPPORTED_EXTENSIONS = [ext.strip() for ext in os.getenv("SUPPORTED_EXTENSIONS", ".csv,.txt").split(",")]
         self.CONTENT_FIELDS = [
-            "search_result_title", "search_result_snippet", "page_description", "page_content"
+            "search_result_snippet", "page_description", "page_content"
         ]
         self.METADATA_FIELDS = [
-            "search_result_link", "page_language"
+            "search_result_title", "search_result_link", "page_language"
         ]
         self.SHOW_PROGRESS = True
 
@@ -102,7 +109,7 @@ class DocumentProcessor:
         for file in files:
             ext = Path(file).suffix.lower()
             if ext == ".csv" and self.config.ACTIONNAIRE_CSV.lower() in file.lower():
-                continue  # skip actionnaire.csv ici, logique spécifique
+                continue
             if ext == ".csv":
                 docs = self.read_csv(file)
             elif ext == ".txt":
@@ -248,7 +255,7 @@ class AzureIndexer:
             contents = [doc["content"] for doc in batch_docs]
 
             def embed_call():
-                resp = oaiclient.embeddings.create(input=contents, model=self.config.EMBEDDING_MODEL)
+                resp = oaiclient.embeddings.create(input=contents, model=self.config.EMBEDDING_DEPLOYMENT_NAME)
                 for idxb, doc in enumerate(batch_docs):
                     doc["embedding"] = resp.data[idxb].embedding
             self.exponential_backoff_retry(embed_call, max_retries=6, base_delay=5)
@@ -275,7 +282,16 @@ class AzureIndexer:
             json.dump(docs, f, ensure_ascii=False, indent=2)
         print(f"[Indexer] Chunks sauvegardés dans {self.config.JSON_PATH}")
 
+    def save_chunks_to_jsonl(self, docs):
+        with open(self.config.JSONL_PATH, "w", encoding="utf-8") as f:
+            for doc in docs:
+                f.write(json.dumps(doc, ensure_ascii=False) + "\n")
+        print(f"[Indexer] Chunks sauvegardés (jsonlines) dans {self.config.JSONL_PATH}")
+
     def create_or_reset_index(self):
+        if not self.config.RECREATE_INDEX:
+            print("[Indexer] (Re)création d'index désactivée (RECREATE_INDEX=False)")
+            return
         idx_client = SearchIndexClient(
             endpoint=self.config.AZURE_SEARCH_ENDPOINT,
             credential=AzureKeyCredential(self.config.AZURE_SEARCH_KEY)
@@ -289,10 +305,11 @@ class AzureIndexer:
 
         fields = [
             SimpleField(name="id", type=SearchFieldDataType.String, key=True),
-            SimpleField(name="search_result_link", type=SearchFieldDataType.String, filterable=True, retrievable=True),
-            SimpleField(name="page_language", type=SearchFieldDataType.String, filterable=True, retrievable=True),
-            SimpleField(name="actionnaires", type=SearchFieldDataType.String, retrievable=True),
-            SimpleField(name="filename", type=SearchFieldDataType.String, filterable=True, retrievable=True),
+            SimpleField(name="search_result_title", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="search_result_link", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="page_language", type=SearchFieldDataType.String, filterable=True),
+            SimpleField(name="actionnaires", type=SearchFieldDataType.String),
+            SimpleField(name="filename", type=SearchFieldDataType.String, filterable=True),
             SearchField(name="content", type=SearchFieldDataType.String, searchable=True, retrievable=True),
             SearchField(
                 name="embedding",
@@ -307,8 +324,8 @@ class AzureIndexer:
             vectorizer_name=vect_name,
             parameters=AzureOpenAIVectorizerParameters(
                 resource_url=self.config.AZURE_OPENAI_ENDPOINT,
-                deployment_name=self.config.EMBEDDING_MODEL,
-                model_name=self.config.EMBEDDING_MODEL,
+                deployment_name=self.config.EMBEDDING_DEPLOYMENT_NAME,
+                model_name=self.config.EMBEDDING_MODEL_NAME,
                 api_key=self.config.AZURE_OPENAI_KEY
             )
         )
@@ -343,15 +360,23 @@ class AzureIndexer:
         idx_client.create_or_update_index(idx)
         print(f"[Indexer] Index '{self.config.INDEX_NAME}' (re)créé")
 
-    def upload_to_index(self):
+    def upload_to_index(self, docs=None):
         search_client = SearchClient(
             endpoint=self.config.AZURE_SEARCH_ENDPOINT,
             index_name=self.config.INDEX_NAME,
             credential=AzureKeyCredential(self.config.AZURE_SEARCH_KEY)
         )
         BATCH_SIZE = self.config.BATCH_UPLOAD
-        with open(self.config.JSON_PATH, "r", encoding="utf-8") as f:
-            docs = json.load(f)
+        if docs is None:
+            # Charger selon le format
+            if self.config.USE_JSONL:
+                docs = []
+                with open(self.config.JSONL_PATH, "r", encoding="utf-8") as f:
+                    for line in f:
+                        docs.append(json.loads(line))
+            else:
+                with open(self.config.JSON_PATH, "r", encoding="utf-8") as f:
+                    docs = json.load(f)
         total_batches = (len(docs) + BATCH_SIZE - 1) // BATCH_SIZE
         print(f"[Indexer] Upload de {len(docs)} docs ({total_batches} batchs) dans Azure Search...")
         for b in tqdm(range(total_batches), desc="Upload batches"):
@@ -363,13 +388,92 @@ class AzureIndexer:
             )
         print("[Indexer] Upload terminé avec succès.")
 
+    def normalize_doc(self, doc: dict) -> dict:
+        """
+        Convertit tous les Decimal en float (pour des besoins d'upload en streaming)
+        parcours récursif simple pour listes et dicts.
+        """
+        def _fix(obj):
+            if isinstance(obj, decimal.Decimal):
+                return float(obj)
+            elif isinstance(obj, dict):
+                return {k: _fix(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [_fix(v) for v in obj]
+            return obj
+
+        return _fix(doc)
+
+    def upload_json_stream_to_index(self, json_path, search_client):
+        BATCH_SIZE = self.config.BATCH_UPLOAD
+        batch = []
+        total = 0
+        with open(json_path, "rb") as f:
+            objects = ijson.items(f, "item")
+            for doc in tqdm(objects, desc="Upload JSON streaming"):
+                doc = self.normalize_doc(doc)
+                batch.append(doc)
+                if len(batch) == BATCH_SIZE:
+                    self.exponential_backoff_retry(
+                        lambda: search_client.upload_documents(documents=batch),
+                        max_retries=6,
+                        base_delay=5
+                    )
+                    total += len(batch)
+                    batch = []
+            if batch:
+                self.exponential_backoff_retry(
+                    lambda: search_client.upload_documents(documents=batch),
+                    max_retries=6,
+                    base_delay=5
+                )
+                total += len(batch)
+        print(f"Upload terminé ({total} documents uploadés depuis {json_path})")
+
+    def upload_jsonl_stream_to_index(self, jsonl_path, search_client):
+        BATCH_SIZE = self.config.BATCH_UPLOAD
+        batch = []
+        total = 0
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in tqdm(f, desc="Upload JSONL streaming"):
+                doc = self.normalize_doc(json.loads(line))
+                batch.append(doc)
+                if len(batch) == BATCH_SIZE:
+                    self.exponential_backoff_retry(
+                        lambda: search_client.upload_documents(documents=batch),
+                        max_retries=6,
+                        base_delay=5
+                    )
+                    total += len(batch)
+                    batch = []
+            if batch:
+                self.exponential_backoff_retry(
+                    lambda: search_client.upload_documents(documents=batch),
+                    max_retries=6,
+                    base_delay=5
+                )
+                total += len(batch)
+        print(f"Upload terminé ({total} documents uploadés depuis {jsonl_path})")
+
+
+    # LA PIPELINEEEEEEEE
     def pipeline(self, documents):
         chunked_docs = self.chunk_documents(documents)
         if self.config.EMBED_BEFORE_UPLOAD:
             chunked_docs = self.add_embeddings(chunked_docs)
-        self.save_chunks_to_json(chunked_docs)
+
+        if self.config.SAVE_CHUNKS_LOCALLY:
+            if self.config.USE_JSONL:
+                self.save_chunks_to_jsonl(chunked_docs)
+            else:
+                self.save_chunks_to_json(chunked_docs)
+
         self.create_or_reset_index()
-        self.upload_to_index()
+        # Upload selon config
+        if self.config.SAVE_CHUNKS_LOCALLY:
+            self.upload_to_index(chunked_docs if not self.config.USE_JSONL else None)
+        else:
+            self.upload_to_index(chunked_docs)
         print("\n[Pipeline] Terminé ! 🎉")
 
 # --------------- MAIN SCRIPT ---------------
@@ -378,5 +482,30 @@ if __name__ == "__main__":
     config = Config()
     processor = DocumentProcessor(config)
     indexer = AzureIndexer(config)
-    documents = processor.read_documents()
-    indexer.pipeline(documents)
+
+    # Modes :
+    if config.UPLOAD_ONLY:
+        # Recréation index si voulu
+        if config.RECREATE_INDEX:
+            indexer.create_or_reset_index()
+
+        search_client = SearchClient(
+            endpoint=config.AZURE_SEARCH_ENDPOINT,
+            index_name=config.INDEX_NAME,
+            credential=AzureKeyCredential(config.AZURE_SEARCH_KEY)
+        )
+        # Streaming JSON array (gros .json)
+        if config.UPLOAD_STREAMING and not config.USE_JSONL:
+            indexer.upload_json_stream_to_index(config.JSON_PATH, search_client)
+        # Streaming JSONL
+        elif config.UPLOAD_STREAMING and config.USE_JSONL:
+            indexer.upload_jsonl_stream_to_index(config.JSONL_PATH, search_client)
+        # Lecture et upload classique (tout en RAM)
+        else:
+            indexer.upload_to_index()
+        print("\n[Pipeline - Upload only] Terminé ! 🎉")
+    else:
+        # Pipeline complet
+        documents = processor.read_documents()
+        indexer.pipeline(documents)
+
